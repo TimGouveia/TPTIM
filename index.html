@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>Teleprompter</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Teleprompter" />
+
+  <!-- Bibliotecas (versões fixas; o service worker guarda uma cópia para uso offline) -->
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.0/babel.min.js"></script>
+
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    body {
+      background: #0f1115;
+      overscroll-behavior: none;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none; user-select: none;
+      -webkit-text-size-adjust: 100%;
+    }
+    textarea { -webkit-user-select: text; user-select: text; }
+    button { touch-action: manipulation; }
+
+    /* Controle deslizante grande, bom para o toque */
+    .tp-range { -webkit-appearance: none; appearance: none; height: 10px; border-radius: 9999px;
+      background: rgba(255,255,255,.22); outline: none; touch-action: none; }
+    .tp-range::-webkit-slider-thumb { -webkit-appearance: none; width: 32px; height: 32px;
+      border-radius: 9999px; background: #ff4a3a; border: 3px solid #fff; }
+    .tp-range::-moz-range-thumb { width: 26px; height: 26px; border-radius: 9999px;
+      background: #ff4a3a; border: 3px solid #fff; }
+
+    /* Seletor de cor redondo */
+    .tp-color { -webkit-appearance: none; appearance: none; width: 44px; height: 44px; padding: 0;
+      border: 0; background: none; border-radius: 9999px; cursor: pointer; }
+    .tp-color::-webkit-color-swatch-wrapper { padding: 0; }
+    .tp-color::-webkit-color-swatch { border: 3px solid rgba(255,255,255,.85); border-radius: 9999px; }
+    .tp-color::-moz-color-swatch { border: 3px solid rgba(255,255,255,.85); border-radius: 9999px; }
+
+    :focus-visible { outline: 3px solid #ffb02e; outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) { * { transition-duration: 0s !important; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Registro do Service Worker (só funciona via http/https, não em file://) -->
+  <script>
+    if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('./service-worker.js').catch(function (e) {
+          console.warn('Service worker não registrado:', e);
+        });
+      });
+    }
+  </script>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } = React;
+
+    /* ============================================================
+       1. CONSTANTES E UTILITÁRIOS
+       ============================================================ */
+    const FONTS = {
+      sans:  { label: 'Sans-serif', short: 'Sans', css: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif' },
+      serif: { label: 'Serif',      short: 'Serif', css: 'Georgia, "Times New Roman", Times, serif' },
+      mono:  { label: 'Monospace',  short: 'Mono', css: 'ui-monospace, Menlo, Consolas, "Courier New", monospace' },
+    };
+    const PALETTE = ['#ff4a3a', '#ffb02e', '#3ddc97', '#35b6ff', '#8b7bff', '#ff6fb5', '#e6e04a', '#2ee6d6'];
+    const SIZE_MIN = 20, SIZE_MAX = 200, SIZE_STEP = 4;
+    const SPEED_MIN = 1, SPEED_MAX = 60, PX_PER_LEVEL = 5; // nível 8 = 40 px/s
+    const STORAGE_PREFIX = 'teleprompter:';
+    const TAG_RE = /(^|\s)(#[\p{L}\p{N}_]+)/gu;
+    const PLACEHOLDER = 'Cole seu roteiro aqui.\n\nUse #hashtags para dividir em seções:\n\n#Introdução\nOlá, pessoal! Hoje vamos falar sobre…\n\n#Desenvolvimento\nO primeiro ponto é…\n\n#Conclusão\nPara fechar…';
+
+    const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+    const tagKey = (t) => t.toLowerCase();
+
+    /* Divide o texto em blocos: tudo entre uma hashtag e a próxima pertence à primeira */
+    function parseScript(text) {
+      const re = new RegExp(TAG_RE.source, 'gu');
+      const marks = [];
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const start = m.index + m[1].length;
+        marks.push({ tag: m[2], start, end: start + m[2].length });
+      }
+      const blocks = [];
+      const head = (marks.length ? text.slice(0, marks[0].start) : text).trim();
+      if (head) blocks.push({ tag: null, body: head });
+      marks.forEach((mk, i) => {
+        const next = marks[i + 1];
+        blocks.push({ tag: mk.tag, body: text.slice(mk.end, next ? next.start : text.length).trim() });
+      });
+      const seen = new Map();
+      marks.forEach((mk) => { const k = tagKey(mk.tag); if (!seen.has(k)) seen.set(k, mk.tag); });
+      return { blocks, tags: Array.from(seen, ([key, label]) => ({ key, label })) };
+    }
+
+    /* ============================================================
+       2. HOOKS
+       ============================================================ */
+    /* Estado salvo no LocalStorage (com pequeno atraso para não gravar a cada tecla) */
+    function usePersistentState(key, initial, delay = 0) {
+      const [value, setValue] = useState(() => {
+        try {
+          const raw = localStorage.getItem(STORAGE_PREFIX + key);
+          return raw === null ? initial : JSON.parse(raw);
+        } catch (e) { return initial; }
+      });
+      const latest = useRef(value);
+      latest.current = value;
+      const save = useCallback(() => {
+        try { localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(latest.current)); } catch (e) {}
+      }, [key]);
+      useEffect(() => {
+        const t = setTimeout(save, delay);
+        return () => clearTimeout(t);
+      }, [value]);
+      useEffect(() => {
+        const onHide = () => save();
+        window.addEventListener('pagehide', onHide);
+        document.addEventListener('visibilitychange', onHide);
+        return () => {
+          window.removeEventListener('pagehide', onHide);
+          document.removeEventListener('visibilitychange', onHide);
+        };
+      }, [save]);
+      return [value, setValue];
+    }
+
+    function useOnline() {
+      const [online, setOnline] = useState(navigator.onLine);
+      useEffect(() => {
+        const up = () => setOnline(true), down = () => setOnline(false);
+        window.addEventListener('online', up);
+        window.addEventListener('offline', down);
+        return () => { window.removeEventListener('online', up); window.removeEventListener('offline', down); };
+      }, []);
+      return online;
+    }
+
+    /* Detecta telas estreitas (celular na vertical) */
+    function useNarrow(maxWidth = 639) {
+      const query = '(max-width: ' + maxWidth + 'px)';
+      const [narrow, setNarrow] = useState(() => window.matchMedia(query).matches);
+      useEffect(() => {
+        const mq = window.matchMedia(query);
+        const h = () => setNarrow(mq.matches);
+        if (mq.addEventListener) mq.addEventListener('change', h); else mq.addListener(h);
+        h();
+        return () => { if (mq.removeEventListener) mq.removeEventListener('change', h); else mq.removeListener(h); };
+      }, [query]);
+      return narrow;
+    }
+
+    function enterFullscreen() {
+      const el = document.documentElement;
+      try {
+        if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      } catch (e) {}
+    }
+    function exitFullscreen() {
+      try {
+        if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+        else if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen();
+      } catch (e) {}
+    }
+
+    /* ============================================================
+       3. ÍCONES
+       ============================================================ */
+    const Svg = ({ size = 28, fill = 'none', children }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill={fill} stroke="currentColor" strokeWidth="2"
+           strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>
+    );
+    const PlayIcon   = (p) => <Svg {...p} fill="currentColor"><path d="M7 4.5v15l13-7.5z" /></Svg>;
+    const PauseIcon  = (p) => <Svg {...p} fill="currentColor"><rect x="6" y="4.5" width="4" height="15" rx="1" /><rect x="14" y="4.5" width="4" height="15" rx="1" /></Svg>;
+    const MinusIcon  = (p) => <Svg {...p}><path d="M5 12h14" /></Svg>;
+    const PlusIcon   = (p) => <Svg {...p}><path d="M12 5v14M5 12h14" /></Svg>;
+    const MenuIcon   = (p) => <Svg {...p}><path d="M4 7h16M4 12h16M4 17h16" /></Svg>;
+    const CloseIcon  = (p) => <Svg {...p}><path d="M6 6l12 12M18 6L6 18" /></Svg>;
+    const MirrorIcon = (p) => <Svg {...p}><path d="M12 3v18" strokeDasharray="2 3" /><path d="M8 7l-5 5 5 5z" /><path d="M16 7l5 5-5 5z" /></Svg>;
+
+    /* ============================================================
+       4. MODO EDITOR
+       ============================================================ */
+    function Editor({ text, setText, fontKey, setFontKey, size, setSize, showTags, setShowTags,
+                      colors, setColors, parsed, colorMap, onStart }) {
+      const online = useOnline();
+      const narrow = useNarrow();
+      const [installEvt, setInstallEvt] = useState(null);
+      const words = useMemo(() => (text.trim() ? text.trim().split(/\s+/).length : 0), [text]);
+      const canStart = parsed.blocks.length > 0;
+      const previewSize = narrow ? clamp(Math.round(size * 0.4), 15, 22) : clamp(Math.round(size * 0.45), 16, 34);
+
+      useEffect(() => {
+        const h = (e) => { e.preventDefault(); setInstallEvt(e); };
+        window.addEventListener('beforeinstallprompt', h);
+        return () => window.removeEventListener('beforeinstallprompt', h);
+      }, []);
+      const install = async () => {
+        if (!installEvt) return;
+        installEvt.prompt();
+        try { await installEvt.userChoice; } catch (e) {}
+        setInstallEvt(null);
+      };
+
+      const btn = 'h-12 min-w-12 px-3 sm:h-14 sm:min-w-14 sm:px-4 rounded-2xl bg-[#232832] hover:bg-[#2c323e] active:scale-95 transition flex items-center justify-center';
+
+      return (
+        <div className="h-[100dvh] overflow-y-auto flex flex-col gap-3 bg-[#0f1115] text-[#e8eaee]"
+             style={{ padding: 'max(0.75rem, env(safe-area-inset-top)) max(0.75rem, env(safe-area-inset-right)) max(0.75rem, env(safe-area-inset-bottom)) max(0.75rem, env(safe-area-inset-left))' }}>
+
+          {/* Cabeçalho */}
+          <header className="flex shrink-0 items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <svg width={narrow ? 28 : 34} height={narrow ? 28 : 34} viewBox="0 0 32 32" aria-hidden="true" className="shrink-0">
+                <rect width="32" height="32" rx="8" fill="#000" />
+                <rect x="6" y="6" width="3" height="5" rx="1.5" fill="#ff4a3a" />
+                <rect x="6" y="13.5" width="3" height="5" rx="1.5" fill="#ffb02e" />
+                <rect x="6" y="21" width="3" height="5" rx="1.5" fill="#3ddc97" />
+                <rect x="12" y="7" width="14" height="3" rx="1.5" fill="#fff" />
+                <rect x="12" y="14.5" width="10" height="3" rx="1.5" fill="#fff" />
+                <rect x="12" y="22" width="14" height="3" rx="1.5" fill="#fff" />
+              </svg>
+              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">Teleprompter</h1>
+              <span className={'ml-1 inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs sm:ml-2 sm:text-sm ' + (online ? 'bg-[#16241d] text-[#7be3b2]' : 'bg-[#2a2314] text-[#ffc760]')}>
+                <span className="h-2 w-2 rounded-full" style={{ background: online ? '#3ddc97' : '#ffb02e' }} />
+                {online ? 'Online' : (narrow ? 'Offline' : 'Offline · roteiro salvo no aparelho')}
+              </span>
+            </div>
+            {installEvt && (
+              <button onClick={install} className="h-10 shrink-0 rounded-2xl border border-[#3a4150] px-4 text-sm font-medium hover:bg-[#181b22] active:scale-95 transition sm:h-12 sm:px-5 sm:text-base">
+                Instalar{narrow ? '' : ' app'}
+              </button>
+            )}
+          </header>
+
+          {/* Tipografia */}
+          <section className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 sm:gap-x-6 sm:gap-y-3" aria-label="Tipografia">
+            <div className="flex w-full items-center gap-2 sm:w-auto" role="group" aria-label="Família da fonte">
+              {Object.entries(FONTS).map(([key, f]) => (
+                <button key={key} onClick={() => setFontKey(key)} aria-pressed={fontKey === key}
+                        className={'flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl border-2 px-3 active:scale-95 transition sm:h-14 sm:flex-none sm:gap-3 sm:px-5 ' +
+                          (fontKey === key ? 'border-[#ff4a3a] bg-[#2a1b1b]' : 'border-transparent bg-[#232832] hover:bg-[#2c323e]')}>
+                  <span style={{ fontFamily: f.css }} className="text-xl leading-none sm:text-2xl">Aa</span>
+                  <span className="text-sm sm:text-base">{narrow ? f.short : f.label}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2" role="group" aria-label="Tamanho da fonte">
+              <button className={btn} onClick={() => setSize((s) => clamp(s - SIZE_STEP, SIZE_MIN, SIZE_MAX))} aria-label="Diminuir fonte"><MinusIcon /></button>
+              <div className="w-14 text-center sm:w-24">
+                <div className="text-xl font-semibold leading-none tabular-nums sm:text-2xl">{size}</div>
+                <div className="mt-1 text-xs text-[#8b93a1]">{narrow ? 'px' : 'px no prompter'}</div>
+              </div>
+              <button className={btn} onClick={() => setSize((s) => clamp(s + SIZE_STEP, SIZE_MIN, SIZE_MAX))} aria-label="Aumentar fonte"><PlusIcon /></button>
+            </div>
+
+            <button role="switch" aria-checked={showTags} onClick={() => setShowTags(!showTags)}
+                    className="flex h-12 items-center gap-3 rounded-2xl bg-[#232832] pl-3 pr-4 hover:bg-[#2c323e] active:scale-95 transition sm:h-14 sm:pl-4 sm:pr-5">
+              <span className="relative inline-block h-7 w-12 shrink-0 rounded-full transition-colors" style={{ background: showTags ? '#ff4a3a' : '#4a5160' }}>
+                <span className="absolute top-1 h-5 w-5 rounded-full bg-white transition-all" style={{ left: showTags ? 24 : 4 }} />
+              </span>
+              <span className="text-sm sm:text-base">{narrow ? 'Mostrar #hashtag' : 'Mostrar #hashtag no prompter'}</span>
+            </button>
+
+            <span className="ml-auto hidden text-sm tabular-nums text-[#8b93a1] sm:inline">{words} palavras</span>
+          </section>
+
+          {/* Área de texto */}
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={PLACEHOLDER}
+            aria-label="Roteiro"
+            className="min-h-[12rem] w-full flex-1 resize-none rounded-2xl border border-[#262b35] bg-[#181b22] p-4 text-[#f2f3f5] placeholder:text-[#5d6575] focus:border-[#ff4a3a] focus:outline-none sm:min-h-0 sm:p-5"
+            style={{ fontFamily: FONTS[fontKey].css, fontSize: previewSize, lineHeight: 1.5 }}
+          />
+
+          {/* Hashtags + botão de ação */}
+          <section className="flex shrink-0 flex-col items-stretch gap-3 sm:flex-row">
+            <div className="max-h-32 min-w-0 overflow-y-auto rounded-2xl border border-[#262b35] bg-[#181b22] p-2 sm:max-h-40 sm:flex-1 sm:p-3">
+              {parsed.tags.length === 0 ? (
+                <p className="px-2 py-2 text-sm text-[#8b93a1] sm:py-3 sm:text-base">
+                  Escreva uma #hashtag no texto para criar uma seção. Cada seção ganha uma faixa lateral na cor que você escolher.
+                </p>
+              ) : (
+                <ul className="flex flex-wrap gap-2">
+                  {parsed.tags.map((t) => (
+                    <li key={t.key} className="flex max-w-full items-center gap-3 rounded-full bg-[#232832] py-1 pl-1 pr-4 sm:pr-5">
+                      <input type="color" className="tp-color shrink-0" value={colorMap[t.key]}
+                             onChange={(e) => setColors((c) => ({ ...c, [t.key]: e.target.value }))}
+                             aria-label={'Cor de ' + t.label} />
+                      <span className="truncate text-base font-medium sm:text-lg">{t.label}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <button onClick={onStart} disabled={!canStart}
+                    className="flex min-h-16 w-full shrink-0 items-center justify-center gap-3 rounded-2xl bg-[#ff4a3a] text-xl font-bold text-white shadow-lg shadow-[#ff4a3a]/20 active:scale-[0.98] transition disabled:opacity-35 disabled:shadow-none sm:min-h-28 sm:w-80 sm:gap-4 sm:text-2xl">
+              <PlayIcon size={narrow ? 28 : 34} />
+              Iniciar Apresentação
+            </button>
+          </section>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       5. MODO DE APRESENTAÇÃO (TELEPROMPTER)
+       ============================================================ */
+    function Presenter({ blocks, colorMap, fontCss, size, setSize, showTags, speed, setSpeed, mirror, setMirror, onExit }) {
+      const contentRef = useRef(null);
+      const progRef = useRef(null);
+      const hideTimer = useRef(null);
+      const drag = useRef(null);
+
+      const [playing, setPlaying] = useState(false);
+      const [uiVisible, setUiVisible] = useState(true);
+      const [drawer, setDrawer] = useState(false);
+      const [active, setActive] = useState(0);
+      const [vh, setVh] = useState(window.innerHeight);
+      const narrow = useNarrow();
+
+      const readLine = Math.round(vh * 0.32); // altura (px) da "linha de leitura"
+      const stripe = Math.max(8, Math.round(size * 0.16));
+
+      // Estado de rolagem fica em ref: o loop de animação não passa pelo React
+      const S = useRef({ y: 0, max: 0, anim: null, dragging: false, offsets: [], activeIdx: 0 });
+      const playingRef = useRef(false), speedRef = useRef(speed), drawerRef = useRef(false), readRef = useRef(readLine);
+      playingRef.current = playing; speedRef.current = speed; drawerRef.current = drawer; readRef.current = readLine;
+
+      useEffect(() => {
+        const onResize = () => setVh(window.innerHeight);
+        window.addEventListener('resize', onResize);
+        return () => window.removeEventListener('resize', onResize);
+      }, []);
+
+      /* ---- aplica a posição na tela (transform CSS, sem tocar em scrollTop) ---- */
+      const paint = useCallback(() => {
+        const c = contentRef.current;
+        if (!c) return;
+        const st = S.current;
+        c.style.transform = 'translate3d(0,' + (-st.y) + 'px,0)';
+        if (progRef.current) progRef.current.style.transform = 'scaleX(' + (st.max > 0 ? st.y / st.max : 0) + ')';
+      }, []);
+
+      /* ---- mede altura total e o início de cada bloco ---- */
+      const measure = useCallback(() => {
+        const c = contentRef.current;
+        if (!c) return;
+        const st = S.current;
+        const max = Math.max(0, c.offsetHeight - window.innerHeight);
+        if (st.max > 0 && max > 0 && max !== st.max) st.y = st.y * (max / st.max); // mantém a posição relativa
+        st.max = max;
+        st.y = clamp(st.y, 0, max);
+        st.offsets = Array.from(c.querySelectorAll('[data-block]')).map((e) => e.offsetTop);
+        paint();
+      }, [paint]);
+
+      useLayoutEffect(() => {
+        measure();
+        const ro = new ResizeObserver(measure);
+        ro.observe(contentRef.current);
+        return () => ro.disconnect();
+      }, [measure]);
+      useLayoutEffect(measure, [size, fontCss, showTags, readLine, blocks]);
+
+      /* ---- loop principal com requestAnimationFrame ---- */
+      useEffect(() => {
+        let raf;
+        let last = performance.now();
+        const tick = (now) => {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          const st = S.current;
+          if (st.anim) {
+            const t = Math.min(1, (now - st.anim.t0) / st.anim.dur);
+            const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // easeInOutCubic
+            st.y = st.anim.from + (st.anim.to - st.anim.from) * e;
+            if (t >= 1) st.anim = null;
+          } else if (playingRef.current && !st.dragging) {
+            st.y += speedRef.current * PX_PER_LEVEL * dt;
+            if (st.y >= st.max) {
+              st.y = st.max;
+              playingRef.current = false;
+              setPlaying(false); // chegou ao fim do roteiro
+            }
+          }
+          st.y = clamp(st.y, 0, st.max);
+          paint();
+
+          // seção atual (para destacar no índice)
+          const pos = st.y + readRef.current + 4;
+          let idx = 0;
+          for (let i = 0; i < st.offsets.length; i++) { if (st.offsets[i] <= pos) idx = i; else break; }
+          if (idx !== st.activeIdx) { st.activeIdx = idx; setActive(idx); }
+
+          raf = requestAnimationFrame(tick);
+        };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+      }, [paint]);
+
+      /* ---- controles que somem sozinhos ---- */
+      const poke = useCallback(() => {
+        setUiVisible(true);
+        clearTimeout(hideTimer.current);
+        hideTimer.current = setTimeout(() => { if (!drawerRef.current) setUiVisible(false); }, 4000);
+      }, []);
+      useEffect(() => { poke(); return () => clearTimeout(hideTimer.current); }, [poke]);
+
+      /* ---- tela sempre acesa durante a apresentação ---- */
+      useEffect(() => {
+        let lock = null;
+        const request = async () => {
+          try { if (navigator.wakeLock && document.visibilityState === 'visible') lock = await navigator.wakeLock.request('screen'); } catch (e) {}
+        };
+        request();
+        document.addEventListener('visibilitychange', request);
+        return () => { document.removeEventListener('visibilitychange', request); try { lock && lock.release(); } catch (e) {} };
+      }, []);
+
+      /* ---- ações ---- */
+      const togglePlay = useCallback(() => {
+        const st = S.current;
+        st.anim = null;
+        if (!playingRef.current && st.max > 0 && st.y >= st.max - 1) st.y = 0; // recomeça do topo
+        setPlaying((p) => !p);
+      }, []);
+
+      const animateTo = (target) => {
+        const st = S.current;
+        const to = clamp(target, 0, st.max);
+        st.anim = { from: st.y, to, t0: performance.now(), dur: Math.min(1100, 350 + Math.abs(to - st.y) * 0.15) };
+      };
+      const jumpToBlock = (i) => {
+        setPlaying(false);
+        animateTo(S.current.offsets[i] - readRef.current);
+        setDrawer(false);
+        poke();
+      };
+      const jumpToTop = () => { setPlaying(false); animateTo(0); setDrawer(false); poke(); };
+      const closeDrawer = () => { setDrawer(false); poke(); };
+
+      const changeSpeed = (d) => { setSpeed((v) => clamp(v + d, SPEED_MIN, SPEED_MAX)); poke(); };
+      const changeSize = (d) => { setSize((v) => clamp(v + d, SIZE_MIN, SIZE_MAX)); poke(); };
+
+      /* ---- teclado (útil com teclado Bluetooth ou no computador) ---- */
+      useEffect(() => {
+        const h = (e) => {
+          if (e.code === 'Space') { e.preventDefault(); togglePlay(); poke(); }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); changeSpeed(1); }
+          else if (e.key === 'ArrowDown') { e.preventDefault(); changeSpeed(-1); }
+          else if (e.key === 'Escape') { if (drawerRef.current) setDrawer(false); else onExit(); }
+        };
+        window.addEventListener('keydown', h);
+        return () => window.removeEventListener('keydown', h);
+      }, []);
+
+      /* ---- arrastar com o dedo / roda do mouse ---- */
+      const onDown = (e) => {
+        drag.current = { id: e.pointerId, y0: e.clientY, pos: S.current.y, moved: false };
+        if (e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId);
+      };
+      const onMove = (e) => {
+        const d = drag.current;
+        if (!d || d.id !== e.pointerId) return;
+        const dy = e.clientY - d.y0;
+        if (!d.moved && Math.abs(dy) > 8) { d.moved = true; S.current.anim = null; S.current.dragging = true; }
+        if (d.moved) S.current.y = clamp(d.pos - dy, 0, S.current.max);
+      };
+      const onUp = () => {
+        const d = drag.current;
+        drag.current = null;
+        S.current.dragging = false;
+        if (d && !d.moved) { // toque simples: mostra/esconde os controles
+          if (uiVisible) { clearTimeout(hideTimer.current); setUiVisible(false); } else poke();
+        }
+      };
+      const onWheel = (e) => { S.current.anim = null; S.current.y = clamp(S.current.y + e.deltaY, 0, S.current.max); };
+
+      const roundBtn = 'flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 active:scale-90 transition';
+      const dim = uiVisible || drawer ? 1 : 0.28;
+      const sz = narrow ? ' h-12 w-12' : ' h-14 w-14';
+
+      return (
+        <div className="fixed inset-0 overflow-hidden bg-black text-white"
+             style={{ background: '#000000', cursor: uiVisible ? 'default' : 'none' }}
+             onPointerMove={(e) => { if (e.pointerType === 'mouse') poke(); }}>
+
+          {/* Texto rolando */}
+          <div className="absolute inset-0"
+               style={{ transform: mirror ? 'scaleX(-1)' : 'none', touchAction: 'none' }}
+               onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onWheel={onWheel}>
+            <div ref={contentRef} style={{ position: 'relative', willChange: 'transform', fontFamily: fontCss, fontSize: size, lineHeight: 1.45 }}>
+              <div style={{ height: readLine }} />
+              <div style={{ maxWidth: '78rem', margin: '0 auto', padding: narrow ? '0 4vw' : '0 5vw' }}>
+                {blocks.map((b, i) => {
+                  const color = b.tag ? colorMap[tagKey(b.tag)] : 'transparent';
+                  return (
+                    <section key={i} data-block={i}
+                             style={{ borderLeft: stripe + 'px solid ' + color, paddingLeft: '0.6em', margin: '0 0 1.1em',
+                                      whiteSpace: 'pre-wrap', overflowWrap: 'break-word', color: '#ffffff' }}>
+                      {showTags && b.tag && (
+                        <div style={{ fontSize: '0.4em', lineHeight: 1.2, fontWeight: 700, marginBottom: '0.4em', color }}>{b.tag}</div>
+                      )}
+                      {b.body}
+                    </section>
+                  );
+                })}
+              </div>
+              <div style={{ height: Math.max(0, vh - readLine) }} />
+            </div>
+          </div>
+
+          {/* Marcadores discretos da linha de leitura */}
+          <div className="pointer-events-none absolute left-0 h-0 w-0"
+               style={{ top: readLine + size * 0.72 - 12, borderTop: '12px solid transparent', borderBottom: '12px solid transparent', borderLeft: '16px solid rgba(255,255,255,.3)' }} />
+          <div className="pointer-events-none absolute right-0 h-0 w-0"
+               style={{ top: readLine + size * 0.72 - 12, borderTop: '12px solid transparent', borderBottom: '12px solid transparent', borderRight: '16px solid rgba(255,255,255,.3)' }} />
+
+          {/* Progresso */}
+          <div ref={progRef} className="pointer-events-none absolute left-0 top-0 h-[3px] w-full origin-left bg-white/40" style={{ transform: 'scaleX(0)' }} />
+
+          {/* Cantos: índice e sair */}
+          <button onPointerDown={poke} onClick={() => { setDrawer(true); setUiVisible(true); }} aria-label="Abrir índice de seções"
+                  className={roundBtn + ' absolute' + sz}
+                  style={{ opacity: dim, top: 'max(0.75rem, env(safe-area-inset-top))', left: 'max(0.75rem, env(safe-area-inset-left))', transition: 'opacity .3s' }}>
+            <MenuIcon />
+          </button>
+          <button onPointerDown={poke} onClick={onExit} aria-label="Sair da apresentação"
+                  className={roundBtn + ' absolute' + sz}
+                  style={{ opacity: dim, top: 'max(0.75rem, env(safe-area-inset-top))', right: 'max(0.75rem, env(safe-area-inset-right))', transition: 'opacity .3s' }}>
+            <CloseIcon />
+          </button>
+
+          {/* Painel flutuante (quebra em duas linhas no celular) */}
+          <div onPointerDown={poke}
+               className="absolute flex flex-wrap items-center justify-center rounded-[2rem] border border-white/10 bg-neutral-900/90 backdrop-blur"
+               style={{ left: 0, right: 0, marginLeft: 'auto', marginRight: 'auto',
+                        width: narrow ? 'calc(100% - 1.5rem)' : 'max-content', maxWidth: 'calc(100% - 1.5rem)',
+                        gap: narrow ? '0.625rem 0.75rem' : '0.75rem 1.25rem',
+                        padding: narrow ? '0.75rem' : '0.75rem 1.25rem',
+                        bottom: 'calc(' + (narrow ? '0.75rem' : '1.25rem') + ' + env(safe-area-inset-bottom))',
+                        opacity: uiVisible ? 1 : 0, pointerEvents: uiVisible ? 'auto' : 'none',
+                        transform: 'translateY(' + (uiVisible ? 0 : 16) + 'px)', transition: 'opacity .3s, transform .3s' }}>
+            <button onClick={() => { togglePlay(); poke(); }} aria-label={playing ? 'Pausar' : 'Reproduzir'}
+                    className={'flex shrink-0 items-center justify-center rounded-full bg-[#ff4a3a] text-white active:scale-90 transition ' + (narrow ? 'h-16 w-16' : 'h-[4.5rem] w-[4.5rem]')}>
+              {playing ? <PauseIcon size={34} /> : <PlayIcon size={34} />}
+            </button>
+
+            <div className="flex items-center gap-2 sm:gap-3" style={narrow ? { flex: '1 1 13rem', minWidth: 0 } : undefined}>
+              <button className={roundBtn + sz + ' shrink-0'} onClick={() => changeSpeed(-1)} aria-label="Mais lento"><MinusIcon /></button>
+              <div className={'flex flex-col items-center gap-2 ' + (narrow ? 'min-w-0 flex-1' : 'w-44')}>
+                <input type="range" className="tp-range w-full" min={SPEED_MIN} max={SPEED_MAX} step="1" value={speed}
+                       onChange={(e) => { setSpeed(Number(e.target.value)); poke(); }} aria-label="Velocidade" />
+                <span className="text-xs tabular-nums text-white/60">Velocidade {speed}</span>
+              </div>
+              <button className={roundBtn + sz + ' shrink-0'} onClick={() => changeSpeed(1)} aria-label="Mais rápido"><PlusIcon /></button>
+            </div>
+
+            <div className="hidden h-10 w-px bg-white/15 sm:block" />
+
+            <div className="flex items-center gap-2">
+              <button className={roundBtn + sz + ' text-xl font-semibold'} onClick={() => changeSize(-SIZE_STEP)} aria-label="Diminuir fonte">A−</button>
+              <button className={roundBtn + sz + ' text-2xl font-semibold'} onClick={() => changeSize(SIZE_STEP)} aria-label="Aumentar fonte">A+</button>
+            </div>
+
+            <button className={roundBtn + sz} onClick={() => { setMirror(!mirror); poke(); }}
+                    aria-pressed={mirror} aria-label="Espelhar texto"
+                    style={mirror ? { background: '#ffffff', color: '#000000' } : undefined}>
+              <MirrorIcon />
+            </button>
+          </div>
+
+          {/* Gaveta de navegação */}
+          <div onClick={closeDrawer} className="absolute inset-0 bg-black/60"
+               style={{ opacity: drawer ? 1 : 0, pointerEvents: drawer ? 'auto' : 'none', transition: 'opacity .25s' }} />
+          <aside aria-hidden={!drawer} aria-label="Índice de seções"
+                 className="absolute left-0 top-0 flex h-full flex-col border-r border-white/10 bg-neutral-950"
+                 style={{ width: 'min(22rem, 85vw)', transform: drawer ? 'translateX(0)' : 'translateX(-100%)', transition: 'transform .28s ease', visibility: drawer ? 'visible' : 'hidden' }}>
+            <div className="flex items-center justify-between px-5 pb-3"
+                 style={{ paddingTop: 'max(0.75rem, env(safe-area-inset-top))' }}>
+              <h2 className="text-xl font-semibold">Seções</h2>
+              <button onClick={closeDrawer} aria-label="Fechar índice" className={roundBtn + ' h-12 w-12'}><CloseIcon size={24} /></button>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-3 pb-6" style={{ WebkitOverflowScrolling: 'touch' }}>
+              <button onClick={jumpToTop} className="mb-1 flex min-h-14 w-full items-center gap-3 rounded-xl px-3 text-left text-lg text-white/80 hover:bg-white/10 active:bg-white/15">
+                <span className="h-8 w-1.5 rounded-full bg-white/30" />
+                Início do roteiro
+              </button>
+              {blocks.map((b, i) => b.tag && (
+                <button key={i} onClick={() => jumpToBlock(i)}
+                        className={'mb-1 flex min-h-16 w-full items-center gap-3 rounded-xl px-3 py-2 text-left active:bg-white/15 ' + (active === i ? 'bg-white/10' : 'hover:bg-white/5')}>
+                  <span className="h-10 w-1.5 shrink-0 rounded-full" style={{ background: colorMap[tagKey(b.tag)] }} />
+                  <span className="min-w-0">
+                    <span className="block truncate text-lg font-semibold">{b.tag}</span>
+                    <span className="block truncate text-sm text-white/50">{b.body.replace(/\s+/g, ' ').slice(0, 70)}</span>
+                  </span>
+                </button>
+              ))}
+            </nav>
+          </aside>
+        </div>
+      );
+    }
+
+    /* ============================================================
+       6. APP
+       ============================================================ */
+    function App() {
+      const [text, setText] = usePersistentState('text', '', 250);
+      const [colors, setColors] = usePersistentState('colors', {});
+      const [fontKey, setFontKey] = usePersistentState('font', 'sans');
+      const [size, setSize] = usePersistentState('size', window.innerWidth < 640 ? 40 : 72);
+      const [speed, setSpeed] = usePersistentState('speed', 8);
+      const [showTags, setShowTags] = usePersistentState('showTags', true);
+      const [mirror, setMirror] = usePersistentState('mirror', false);
+      const [mode, setMode] = useState('editor');
+
+      const parsed = useMemo(() => parseScript(text), [text]);
+
+      // cor escolhida pelo usuário ou, se ainda não houver, uma cor padrão da paleta
+      const colorMap = useMemo(() => {
+        const map = {};
+        parsed.tags.forEach((t, i) => { map[t.key] = colors[t.key] || PALETTE[i % PALETTE.length]; });
+        return map;
+      }, [parsed.tags, colors]);
+
+      const fsRef = useRef(false);
+      const modeRef = useRef(mode);
+      modeRef.current = mode;
+
+      // se o usuário sair da tela cheia pelo sistema, volta ao editor
+      useEffect(() => {
+        const h = () => {
+          const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+          if (fs) fsRef.current = true;
+          else if (fsRef.current) { fsRef.current = false; if (modeRef.current === 'present') setMode('editor'); }
+        };
+        document.addEventListener('fullscreenchange', h);
+        document.addEventListener('webkitfullscreenchange', h);
+        return () => { document.removeEventListener('fullscreenchange', h); document.removeEventListener('webkitfullscreenchange', h); };
+      }, []);
+
+      const start = () => {
+        if (!parsed.blocks.length) return;
+        enterFullscreen();
+        setMode('present');
+      };
+      const exit = () => { fsRef.current = false; exitFullscreen(); setMode('editor'); };
+
+      if (mode === 'present') {
+        return (
+          <Presenter blocks={parsed.blocks} colorMap={colorMap} fontCss={FONTS[fontKey].css}
+                     size={size} setSize={setSize} showTags={showTags} speed={speed} setSpeed={setSpeed}
+                     mirror={mirror} setMirror={setMirror} onExit={exit} />
+        );
+      }
+      return (
+        <Editor text={text} setText={setText} fontKey={fontKey} setFontKey={setFontKey}
+                size={size} setSize={setSize} showTags={showTags} setShowTags={setShowTags}
+                colors={colors} setColors={setColors} parsed={parsed} colorMap={colorMap} onStart={start} />
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
